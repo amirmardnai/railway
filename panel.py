@@ -411,14 +411,12 @@ def sync_xray_config():
             # - bufferSize=64 (کیلوبایت): اندازه بافر داخلی هر اتصال؛ این مقدار دقیقاً همان عددی است که
             #   پروژه‌های مشابه Xray برای هزاران کاربر هم‌زمان روی سرورهای کم‌رم توصیه و تست کرده‌اند
             #   (پیش‌فرض اگر ست نشود می‌تواند چند برابر این مقدار رم بگیرد).
-            # bufferSize از 64KB به 16KB کاهش یافت: این اصلی‌ترین عامل رشد رم زیر بار بالاست.
-            # هر اتصال در هر جهت یک بافر می‌گیرد؛ با ۱۰۰ کاربر و ده‌ها اتصال موازی هرکدام،
-            # 64KB به‌سرعت به صدها مگابایت می‌رسد و کانتینر OOM-kill می‌شود. 16KB روی سرعت
-            # تاثیر محسوسی ندارد (کانفیگ‌های low-memory حتی 4KB استفاده می‌کنند) ولی رم را ۴ برابر کم می‌کند.
-            # connIdle از 60 به 30 ثانیه: اتصالات نیمه‌باز موبایل سریع‌تر بسته می‌شوند و بافرشان آزاد می‌شود.
+            # bufferSize از 64KB به 32KB کاهش یافت: اصلی‌ترین اهرم کاهش رم زیر بار بالا.
+            # این تغییر هیچ اتصالی را قطع نمی‌کند (فقط اندازه‌ی بافر داخلی relay است) و رم را نصف می‌کند.
+            # connIdle / uplinkOnly / downlinkOnly به مقدار اصلی و تست‌شده برگشتند تا اتصالات سالم قطع نشوند.
             "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True,
-                              "handshake": 4, "connIdle": 30, "uplinkOnly": 1, "downlinkOnly": 1,
-                              "bufferSize": 16}},
+                              "handshake": 4, "connIdle": 60, "uplinkOnly": 2, "downlinkOnly": 4,
+                              "bufferSize": 32}},
             "system": {"statsInboundUplink": True, "statsInboundDownlink": True}
         },
         "api": {"tag": "api_service", "services": ["HandlerService", "LoggerService", "StatsService"]},
