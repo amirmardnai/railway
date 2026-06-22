@@ -59,6 +59,8 @@ nginx_log_pos = 0
 user_traffic = {}
 user_last_active = {}       # uid -> last_seen   کاربران آنلاین (از شمارندهٔ ترافیک + لاگ Xray)
 ws_connections = {}        # ip -> last_seen   مجموعهٔ ایپی‌های واقعی فعال روی /ws (برای شمارش دقیق ایپی آنلاین)
+protocol_connections = {}  # protocol -> {ip: last_seen}  ایپی واقعی هر پروتکل از لاگ Nginx
+user_protocol_active = {}  # uid -> {protocol: last_seen}  کدام کاربر به کدام پروتکل وصل است
 inbound_last_active = {}   # tag -> last_seen   آیا همین الان ترافیک از این inbound رد شده (مستقل از تشخیص ایپی)
 total_unique_ips = set()
 # شمارش دقیق اتصالات هم‌زمان مستقیماً از stub_status نگینکس (نه تخمین) — هر ۵ ثانیه آپدیت می‌شود.
@@ -502,7 +504,7 @@ def sync_xray_config():
         _inb["settings"]["clients"] = [_client_for_inbound(_uid) for _uid in active_links.keys()]
     
     cfg = {
-        "log": {"loglevel": "warning", "access": XRAY_LOG}, 
+        "log": {"loglevel": "info", "access": XRAY_LOG}, 
         "stats": {},
         "policy": {
             # تنظیمات زیر برای جلوگیری از مصرف بی‌رویه رم وقتی تعداد زیادی کاربر هم‌زمان وصل می‌شوند اضافه شده:
@@ -674,6 +676,11 @@ async def stats_updater():
                         elif direction == "uplink": stats["up_bytes"] += value
                         if value > 0:
                             user_last_active[uid] = time.time()
+                            if uid in user_protocol_active:
+                                for p in list(user_protocol_active[uid].keys()):
+                                    t = PROTO_TO_TAG.get(p)
+                                    if t and time.time() - inbound_last_active.get(t, 0) < 30:
+                                        user_protocol_active[uid][p] = time.time()
                     elif len(parts) == 4 and parts[0] == "inbound" and parts[2] == "traffic":
                         # این شمارنده مستقیماً از خود Xray می‌آید، پس بدون توجه به اینکه Nginx ایپی واقعی
                         # کاربر را نشان می‌دهد یا نه، دقیقاً می‌فهمیم همین الان از کدام پروتکل ترافیک رد شده.
@@ -704,6 +711,10 @@ async def stats_updater():
                     if len(total_unique_ips) < 2000: total_unique_ips.add(real_ip)
                     if len(ws_connections) < 5000 or real_ip in ws_connections:
                         ws_connections[real_ip] = now_t1
+                    proto = fields[3].strip() if len(fields) >= 4 else None
+                    if proto:
+                        if proto not in protocol_connections: protocol_connections[proto] = {}
+                        protocol_connections[proto][real_ip] = now_t1
         except: pass
 
         # ۳. خواندن لاگ Xray برای تشخیص اینکه کدام کاربر (UUID) آنلاین است.
@@ -714,8 +725,13 @@ async def stats_updater():
             if new_data:
                 now_t = time.time()
                 for m in XRAY_RE.finditer(new_data):
-                    uid = m.group(3)
+                    ip, tag, uid = m.group(1), m.group(2), m.group(3)
                     if uid not in LINKS: continue
+                    proto = TAG_TO_PROTO.get(tag)
+                    if not proto: continue
+                    if uid not in user_protocol_active:
+                        user_protocol_active[uid] = {}
+                    user_protocol_active[uid][proto] = now_t
                     user_last_active[uid] = now_t
         except: pass
 
@@ -728,6 +744,14 @@ async def stats_updater():
             if now - user_last_active[uid] > 60: del user_last_active[uid]
         for ip in list(ws_connections.keys()):
             if now - ws_connections[ip] > 60: del ws_connections[ip]
+        for proto in list(protocol_connections.keys()):
+            for ip in list(protocol_connections[proto].keys()):
+                if now - protocol_connections[proto][ip] > 60: del protocol_connections[proto][ip]
+            if not protocol_connections[proto]: del protocol_connections[proto]
+        for uid in list(user_protocol_active.keys()):
+            for proto in list(user_protocol_active[uid].keys()):
+                if now - user_protocol_active[uid][proto] > 60: del user_protocol_active[uid][proto]
+            if not user_protocol_active[uid]: del user_protocol_active[uid]
         # پاکسازی inbound_last_active (۶۰ ثانیه بعد از آخرین ترافیک)
         for tag in list(inbound_last_active.keys()):
             if now - inbound_last_active[tag] > 60: del inbound_last_active[tag]
@@ -949,19 +973,39 @@ def fmt_speed(bps):
 
 def build_active_configs():
     """
-    لیست کاربران آنلاین روی کانفیگ VLESS+WS را می‌سازد.
-    آنلاین‌بودن از user_last_active (شمارندهٔ ترافیک خود Xray + لاگ Xray) گرفته می‌شود — دقیق.
-    شمارش ایپیِ واقعیِ هر کاربر پشت نگینکس ممکن نیست (همه 127.0.0.1 دیده می‌شوند)، پس
-    ip_count برای هر کاربر آنلاین = ۱ گزارش می‌شود؛ شمارش دقیقِ کلِ ایپی‌های فعال جداگانه از
-    لاگ نگینکس (ws_connections) و اتصالات هم‌زمان از stub_status می‌آید.
+    لیست کاربران آنلاین را می‌سازد.
+    مرحله ۱: از user_protocol_active (mapping دقیق از لاگ Xray) استفاده می‌کند.
+    مرحله ۲: fallback — کاربرانی که آنلاین هستند ولی هنوز mapping ندارند.
     """
     items = []
     now = time.time()
-    online_uids = [uid for uid in user_last_active
-                   if uid in LINKS and now - user_last_active[uid] <= 60]
-    for uid in online_uids:
+    mapped_uids = set()
+
+    # مرحله ۱: کاربران با mapping دقیق (از لاگ Xray)
+    proto_users = {}
+    for uid, protos in user_protocol_active.items():
+        if uid not in LINKS: continue
         label = LINKS[uid].get("label", uid[:8])
-        items.append({"config": PROTOCOL_LABELS["ws"], "label": label, "ip_count": 1, "attributed": True})
+        for proto, last_seen in protos.items():
+            if now - last_seen > 60: continue
+            if proto not in proto_users:
+                proto_users[proto] = []
+            proto_users[proto].append({"uid": uid, "label": label})
+            mapped_uids.add(uid)
+
+    for proto, users in proto_users.items():
+        if not users: continue
+        config_label = PROTOCOL_LABELS.get(proto, proto)
+        ip_count = len(protocol_connections.get(proto, {})) or len(users)
+        for user in users:
+            items.append({"config": config_label, "label": user["label"], "ip_count": 1, "attributed": True})
+
+    # مرحله ۲: fallback — کاربرانی که آنلاین هستند (Stats API) ولی mapping ندارند
+    unmapped_online = [uid for uid in user_last_active if uid in LINKS and uid not in mapped_uids
+                       and now - user_last_active[uid] <= 60]
+    for uid in unmapped_online:
+        label = LINKS[uid].get("label", uid[:8])
+        items.append({"config": PROTOCOL_LABELS.get("ws", "VLESS + WS + TLS"), "label": label, "ip_count": 1, "attributed": True})
     return items
 
 def format_active_configs_text(items):
