@@ -61,6 +61,7 @@ user_last_active = {}       # uid -> last_seen   کاربران آنلاین (ا
 ws_connections = {}        # ip -> last_seen   مجموعهٔ ایپی‌های واقعی فعال روی /ws (برای شمارش دقیق ایپی آنلاین)
 protocol_connections = {}  # protocol -> {ip: last_seen}  ایپی واقعی هر پروتکل از لاگ Nginx
 user_protocol_active = {}  # uid -> {protocol: last_seen}  کدام کاربر به کدام پروتکل وصل است
+active_connections = {}    # uid -> {ip: last_seen}  ایپی واقعی هر کاربر (از لاگ Xray — دقیق و فوری)
 inbound_last_active = {}   # tag -> last_seen   آیا همین الان ترافیک از این inbound رد شده (مستقل از تشخیص ایپی)
 total_unique_ips = set()
 # شمارش دقیق اتصالات هم‌زمان مستقیماً از stub_status نگینکس (نه تخمین) — هر ۵ ثانیه آپدیت می‌شود.
@@ -88,7 +89,7 @@ CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")  # RFC 6598 - Shared/CGNAT Add
 # پیشوند "tcp:" قبل از ایپی اختیاری گرفته می‌شود، و تگ inbound داخل [] هم استخراج می‌شود تا
 # بشود فقط روی reality-in فیلتر کرد (نه هر خط دیگری که به اشتباه ایپی غیر-لوکال داشته باشد).
 XRAY_RE = re.compile(
-    r'from\s+(?:tcp:)?([\d.a-fA-F:]+):\d+\s+accepted\s+\S+\s+\[([\w\-]+)\s*->[^\]]*\]\s*email:\s*'
+    r'from\s+(?:tcp:)?([\d.a-fA-F:]+):\d+\s+accepted\s+\S+\s+\[([\w\-]+)\s*(?:->|>>)[^\]]*\]\s*email:\s*'
     r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})',
     re.IGNORECASE
 )
@@ -717,9 +718,9 @@ async def stats_updater():
                         protocol_connections[proto][real_ip] = now_t1
         except: pass
 
-        # ۳. خواندن لاگ Xray برای تشخیص اینکه کدام کاربر (UUID) آنلاین است.
-        # لاگ Xray شامل تگ inbound و ایمیل (UUID) هر اتصال است. برای WS ایپی همیشه 127.0.0.1 است
-        # (چون از Nginx رد شده)، پس فقط آنلاین‌بودنِ کاربر را از آن می‌گیریم؛ ایپیِ واقعی از لاگ Nginx می‌آید.
+        # ۳. خواندن لاگ Xray برای تشخیص اینکه کدام کاربر (UUID) آنلاین است + ایپی واقعی.
+        # نکته: در نسخه‌های جدید Xray، حتی برای WS پشت Nginx، ایپی واقعی کاربر نشان داده می‌شود
+        # (از هدر X-Forwarded-For/X-Real-IP) با پورت :0. پس ایپی واقعی هم از اینجا استخراج می‌شود.
         try:
             new_data, xray_log_pos = await _read_log_segment_async(XRAY_LOG, xray_log_pos, 2 * 1024 * 1024)
             if new_data:
@@ -733,6 +734,13 @@ async def stats_updater():
                         user_protocol_active[uid] = {}
                     user_protocol_active[uid][proto] = now_t
                     user_last_active[uid] = now_t
+                    # ردیابی ایپی واقعی هر کاربر (Xray ایپی را فوری ثبت می‌کند، برخلاف Nginx که موقع بسته‌شدن ثبت می‌کند)
+                    if is_public_ip(ip):
+                        if uid not in active_connections:
+                            active_connections[uid] = {}
+                        active_connections[uid][ip] = now_t
+                        if len(total_unique_ips) < 2000:
+                            total_unique_ips.add(ip)
         except: pass
 
         # ۴. خواندن شمارش دقیق اتصالات هم‌زمان از stub_status نگینکس (همان عددی که خود نگینکس می‌بیند).
@@ -744,6 +752,10 @@ async def stats_updater():
             if now - user_last_active[uid] > 60: del user_last_active[uid]
         for ip in list(ws_connections.keys()):
             if now - ws_connections[ip] > 60: del ws_connections[ip]
+        for uid in list(active_connections.keys()):
+            for ip in list(active_connections[uid].keys()):
+                if now - active_connections[uid][ip] > 30: del active_connections[uid][ip]
+            if not active_connections[uid]: del active_connections[uid]
         for proto in list(protocol_connections.keys()):
             for ip in list(protocol_connections[proto].keys()):
                 if now - protocol_connections[proto][ip] > 60: del protocol_connections[proto][ip]
@@ -973,39 +985,27 @@ def fmt_speed(bps):
 
 def build_active_configs():
     """
-    لیست کاربران آنلاین را می‌سازد.
-    مرحله ۱: از user_protocol_active (mapping دقیق از لاگ Xray) استفاده می‌کند.
-    مرحله ۲: fallback — کاربرانی که آنلاین هستند ولی هنوز mapping ندارند.
+    لیست دستگاه‌های آنلاین را می‌سازد.
+    هر آیپی واقعی = یک دستگاه/نفر مجزا. این برای حالتی که یک UUID بین چند نفر به اشتراک گذاشته شده دقیق است.
     """
     items = []
     now = time.time()
-    mapped_uids = set()
+    seen_ips = set()
 
-    # مرحله ۱: کاربران با mapping دقیق (از لاگ Xray)
-    proto_users = {}
-    for uid, protos in user_protocol_active.items():
+    # مرحله ۱: از active_connections (ایپی واقعی هر کاربر از لاگ Xray — فوری و دقیق)
+    for uid, ips in active_connections.items():
         if uid not in LINKS: continue
         label = LINKS[uid].get("label", uid[:8])
-        for proto, last_seen in protos.items():
-            if now - last_seen > 60: continue
-            if proto not in proto_users:
-                proto_users[proto] = []
-            proto_users[proto].append({"uid": uid, "label": label})
-            mapped_uids.add(uid)
+        for ip, last_seen in ips.items():
+            if now - last_seen > 30: continue
+            seen_ips.add(ip)
+            items.append({"config": PROTOCOL_LABELS.get("ws", "VLESS + WS + TLS"), "label": f"{label} ({ip})", "ip_count": 1, "attributed": True})
 
-    for proto, users in proto_users.items():
-        if not users: continue
-        config_label = PROTOCOL_LABELS.get(proto, proto)
-        ip_count = len(protocol_connections.get(proto, {})) or len(users)
-        for user in users:
-            items.append({"config": config_label, "label": user["label"], "ip_count": 1, "attributed": True})
-
-    # مرحله ۲: fallback — کاربرانی که آنلاین هستند (Stats API) ولی mapping ندارند
-    unmapped_online = [uid for uid in user_last_active if uid in LINKS and uid not in mapped_uids
-                       and now - user_last_active[uid] <= 60]
-    for uid in unmapped_online:
-        label = LINKS[uid].get("label", uid[:8])
-        items.append({"config": PROTOCOL_LABELS.get("ws", "VLESS + WS + TLS"), "label": label, "ip_count": 1, "attributed": True})
+    # مرحله ۲: fallback — کاربرانی که ترافیک دارند ولی هنوز ایپی‌شان ثبت نشده
+    for uid in user_last_active:
+        if uid in LINKS and uid not in active_connections and now - user_last_active[uid] <= 30:
+            label = LINKS[uid].get("label", uid[:8])
+            items.append({"config": PROTOCOL_LABELS.get("ws", "VLESS + WS + TLS"), "label": label, "ip_count": 1, "attributed": True})
     return items
 
 def format_active_configs_text(items):
@@ -1037,7 +1037,7 @@ async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
         "total_users": len(LINKS),
         # شمارش‌های دقیق:
         "live_connections": net_info.get("active", 0),   # اتصالات هم‌زمان نگینکس (stub_status) — دقیق
-        "active_ips": len(ws_connections),                # ایپی‌های واقعیِ فعال روی /ws (پنجرهٔ ۶۰ث) — دقیق
+        "active_ips": sum(len(ips) for ips in active_connections.values()),  # ایپی‌های واقعی فعال (از لاگ Xray — فوری و دقیق)
         "active_uuids": len(user_last_active),            # کاربران آنلاین (UUID) — دقیق
         "total_connected": len(total_unique_ips),         # کل ایپی‌های دیده‌شده از ابتدا (تجمعی)
         "bytes": stats["bytes"],
@@ -1239,7 +1239,7 @@ async def api_links(request: Request, token: Optional[str] = Cookie(None)):
         remaining_days = max(0, int((expiry_time - time.time()) / 86400)) if expiry_time else 0
         out.append({
             "uuid": uid, "label": info["label"], "created_at": info["created_at"],
-            "online": is_online, "used_traffic": used_traffic,
+            "online": is_online, "online_ips": len(active_connections.get(uid, {})), "used_traffic": used_traffic,
             "status": info.get("status", "active"),
             "data_limit": data_limit, "remaining_data": remaining_data,
             "remaining_days": remaining_days, "short_id": info.get("short_id", ""),
@@ -1559,7 +1559,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--card2)}
   <div class="stats">
     <div class="stat glass hl"><div class="ic">🔌</div><div class="v" id="s-live">—</div><div class="l">اتصالات فعال (هم‌زمان)</div></div>
     <div class="stat glass hl"><div class="ic">🌐</div><div class="v" id="s-ips">—</div><div class="l">ایپی‌های آنلاین</div></div>
-    <div class="stat glass hl"><div class="ic">🟢</div><div class="v" id="s-online">—</div><div class="l">کاربران آنلاین</div></div>
+    <div class="stat glass hl"><div class="ic">🟢</div><div class="v" id="s-online">—</div><div class="l">دستگاه‌های آنلاین</div></div>
     <div class="stat glass"><div class="ic">👤</div><div class="v" id="s-total">—</div><div class="l">کل کاربران</div></div>
     <div class="stat glass"><div class="ic">⬇️</div><div class="v" id="s-dl">—</div><div class="l">سرعت دانلود</div><canvas id="sp-dl" width="70" height="30"></canvas></div>
     <div class="stat glass"><div class="ic">⬆️</div><div class="v" id="s-ul">—</div><div class="l">سرعت آپلود</div><canvas id="sp-ul" width="70" height="30"></canvas></div>
@@ -1629,7 +1629,7 @@ async function logout(){await fetch('/api/logout',{method:'POST'});location.href
 async function loadStats(){try{const r=await fetch('/api/stats',{credentials:'include'});if(r.status===401){location.href='__LOGIN_URL__';return}const d=await r.json();
 document.getElementById('s-live').textContent=d.live_connections;
 document.getElementById('s-ips').textContent=d.active_ips;
-document.getElementById('s-online').textContent=d.active_uuids;
+document.getElementById('s-online').textContent=d.active_ips;
 document.getElementById('s-total').textContent=d.total_users;
 document.getElementById('s-dl').textContent=fmtSpeed(d.dl_speed);
 document.getElementById('s-ul').textContent=fmtSpeed(d.ul_speed);
@@ -1643,7 +1643,7 @@ document.getElementById('s-disk').textContent=d.disk_used_gb+' / '+d.disk_total_
 document.getElementById('s-hist').textContent=d.total_connected;
 push(hist.dl,d.dl_speed);push(hist.ul,d.ul_speed);push(hist.ram,d.ram);push(hist.cpu,d.cpu);
 spark('sp-dl',hist.dl,'rgb(52,211,153)');spark('sp-ul',hist.ul,'rgb(124,140,255)');spark('sp-ram',hist.ram,'rgb(167,121,255)');spark('sp-cpu',hist.cpu,'rgb(54,214,231)');
-var cfgs=d.active_configs||[];document.getElementById('on-badge').textContent=(d.active_uuids||0)+' آنلاین';
+var cfgs=d.active_configs||[];document.getElementById('on-badge').textContent=(d.active_ips||0)+' آنلاین';
 var ol=document.getElementById('online-list');
 if(!cfgs.length){ol.innerHTML='<div style="color:var(--muted);text-align:center;padding:14px">هیچ کاربری آنلاین نیست</div>';}
 else{ol.innerHTML=cfgs.map(function(it){return '<div class="ucard"><span class="dot"></span><span class="nm">'+it.label+'</span><span class="cf">'+it.config+'</span></div>';}).join('');}
